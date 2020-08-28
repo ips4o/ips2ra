@@ -1,0 +1,6 @@
+[submodule "extern/tlx"]
+	path = extern/tlx
+	url = https://github.com/ips4o/tlx.git
+[submodule "extern/cmake-modules"]
+	path = extern/cmake-modules
+	url = https://github.com/ips4o/legacy-modules.git

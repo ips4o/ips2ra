@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/sequential.hpp
+ * include/ips2ra/sequential.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -37,49 +37,137 @@
 
 #include <utility>
 
-#include "ips4o_fwd.hpp"
+#include "ips2ra_fwd.hpp"
 #include "base_case.hpp"
 #include "memory.hpp"
 #include "partitioning.hpp"
+#include "sampling.hpp"
+#include "ska_sort.hpp"
+#include "utils.hpp"
 
-namespace ips4o {
+namespace ips2ra {
 namespace detail {
+
+#if defined(_REENTRANT)
+
+/**
+ * Recursive entry point of the sequential algorithm for the parallel algorithm
+ */
+template <class Cfg>
+void Sorter<Cfg>::sequential(const iterator begin, const Task& task,
+                             PrivateQueue<Task>& queue) {
+    IPS2RA_IS_NOT(!levelExists(task.level));
+    IPS2RA_IS_NOT(task.end - task.begin <= Cfg::kSmallestSortSize);
+    IPS2RA_IS_NOT(level_end_ == -1);
+
+    // Check for medium sized base case.
+    const auto n = task.end - task.begin;
+    if (n < Cfg::kSkasort) {
+#ifdef IPS4O_TIMER
+        g_overhead.stop();
+        g_base_case.start();
+#endif
+
+        ips2ra::detail::SimpleSkaSort<Cfg::kSmallestSortSize, Cfg::kBaseCaseSize,
+                                      Cfg::kAmericanFlagSort,
+                                      key_type>::Sort(begin + task.begin,
+                                                      begin + task.end, local_.offs,
+                                                      local_.classifier.getExtractor(),
+                                                      task.level, level_end_);
+
+#ifdef IPS4O_TIMER
+        g_base_case.stop();
+        g_overhead.start();
+#endif
+
+        return;
+    }
+
+    diff_t bucket_start[Cfg::kMaxBuckets + 1];
+
+    // Do the partitioning
+    partition<false>(begin + task.begin, begin + task.end, task.level, bucket_start, 0,
+                     1);
+
+    // Final base case is executed in cleanup step, so we're done here
+    if (isLastLevel(task.level)) { return; }
+
+    // Recurse
+    for (int i = Cfg::kMaxBuckets - 1; i >= 0; --i) {
+        const auto start = bucket_start[i];
+        const auto stop = bucket_start[i + 1];
+        if (stop - start > Cfg::kSmallestSortSize)
+            queue.emplace(task.begin + start, task.begin + stop, task.level + 1);
+    }
+}
+
+#endif  // _REENTRANT
+
+/**
+ * Entry point of the sequential algorithm.
+ */
+template <class Cfg>
+void Sorter<Cfg>::sequential(const iterator begin, const iterator end) {
+    // Check for base case
+    static constexpr std::ptrdiff_t threshold = Cfg::kSmallestSortSize;
+    auto& extract_key = local_.classifier.getExtractor();
+    auto comp = [&extract_key](auto&& l, auto&& r) {
+        return extract_key(l) < extract_key(r);
+    };
+    if (!detail::smallestSortIfAtMostThreshold<threshold>(begin, end, comp)) {
+        const auto [level_begin, level_end] = sequentialGetLevels(begin, end);
+        level_end_ = level_end;
+
+        if (levelExists(level_begin)) { sequentialRec(begin, end, level_begin); }
+    }
+}
 
 /**
  * Recursive entry point for sequential algorithm.
  */
 template <class Cfg>
-void Sorter<Cfg>::sequential(const iterator begin, const iterator end) {
-    // Check for base case
+void Sorter<Cfg>::sequentialRec(const iterator begin, const iterator end,
+                                const int level) {
+    IPS2RA_IS_NOT(!levelExists(level));
+    IPS2RA_IS_NOT(end - begin <= Cfg::kSmallestSortSize);
+    IPS2RA_IS_NOT(level_end_ == -1);
+
+    // Check for medium sized base case.
     const auto n = end - begin;
-    if (n <= 2 * Cfg::kBaseCaseSize) {
-        detail::baseCaseSort(begin, end, local_.classifier.getComparator());
+    if (n < Cfg::kSkasort) {
+#ifdef IPS4O_TIMER
+        g_overhead.stop();
+        g_base_case.start();
+#endif
+
+        ips2ra::detail::SimpleSkaSort<Cfg::kSmallestSortSize, Cfg::kBaseCaseSize,
+                                      Cfg::kAmericanFlagSort,
+                                      key_type>::Sort(begin, end, local_.offs,
+                                                      local_.classifier.getExtractor(),
+                                                      level, level_end_);
+
+#ifdef IPS4O_TIMER
+        g_base_case.stop();
+        g_overhead.start();
+#endif
+
         return;
     }
+
     diff_t bucket_start[Cfg::kMaxBuckets + 1];
 
     // Do the partitioning
-    const auto res = partition<false>(begin, end, bucket_start, nullptr, 0, 1);
-    const int num_buckets = std::get<0>(res);
-    const bool equal_buckets = std::get<1>(res);
+    partition<false>(begin, end, level, bucket_start, 0, 1);
 
     // Final base case is executed in cleanup step, so we're done here
-    if (n <= Cfg::kSingleLevelThreshold) {
-        return;
-    }
+    if (isLastLevel(level)) return;
 
     // Recurse
-    for (int i = 0; i < num_buckets; i += 1 + equal_buckets) {
+    for (int i = 0; i < Cfg::kMaxBuckets; ++i) {
         const auto start = bucket_start[i];
         const auto stop = bucket_start[i + 1];
-        if (stop - start > 2 * Cfg::kBaseCaseSize)
-            sequential(begin + start, begin + stop);
-    }
-    if (equal_buckets) {
-        const auto start = bucket_start[num_buckets - 1];
-        const auto stop = bucket_start[num_buckets];
-        if (stop - start > 2 * Cfg::kBaseCaseSize)
-            sequential(begin + start, begin + stop);
+        if (stop - start > Cfg::kSmallestSortSize)
+            sequentialRec(begin + start, begin + stop, level + 1);
     }
 }
 
@@ -94,29 +182,20 @@ class SequentialSorter {
     using iterator = typename Cfg::iterator;
 
  public:
-  explicit SequentialSorter(bool check_sorted, typename Cfg::less comp)
-    : check_sorted(check_sorted)
-    , buffer_storage_(1)
-            , local_ptr_(Cfg::kDataAlignment, std::move(comp), buffer_storage_.get()) {}
+    explicit SequentialSorter(typename Cfg::Extractor extractor)
+        : buffer_storage_(1)
+        , local_ptr_(Cfg::kDataAlignment, std::move(extractor), buffer_storage_.get()) {}
 
-    explicit SequentialSorter(bool check_sorted, typename Cfg::less comp, char* buffer_storage)
-            : check_sorted(check_sorted)
-    , local_ptr_(Cfg::kDataAlignment, std::move(comp), buffer_storage) {}
+    explicit SequentialSorter(typename Cfg::Extractor extractor, char* buffer_storage)
+        : local_ptr_(Cfg::kDataAlignment, std::move(extractor), buffer_storage) {}
 
     void operator()(iterator begin, iterator end) {
-      if (check_sorted) {
-        const bool sorted = detail::sortedCaseSort(begin, end,
-                                                   local_ptr_.get().classifier.getComparator());
-        if (sorted) return;
-      }
-  
         Sorter(local_ptr_.get()).sequential(std::move(begin), std::move(end));
     }
 
  private:
-  const bool check_sorted;
     typename Sorter::BufferStorage buffer_storage_;
     detail::AlignedPtr<typename Sorter::LocalData> local_ptr_;
 };
 
-}  // namespace ips4o
+}  // namespace ips2ra

@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/parallel.hpp
+ * include/ips2ra/parallel.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -34,109 +34,294 @@
  *****************************************************************************/
 
 #pragma once
-#if defined(_REENTRANT) || defined(_OPENMP)
+#if defined(_REENTRANT)
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
-#include "ips4o_fwd.hpp"
-#include "memory.hpp"
-#include "sequential.hpp"
-#include "partitioning.hpp"
+#include <tbb/concurrent_queue.h>
 
-namespace ips4o {
+#include "ips2ra_fwd.hpp"
+#include "config.hpp"
+#include "memory.hpp"
+#include "partitioning.hpp"
+#include "sequential.hpp"
+#include "task.hpp"
+
+namespace ips2ra {
 namespace detail {
 
 /**
  * Processes sequential subtasks in the parallel algorithm.
  */
 template <class Cfg>
-void Sorter<Cfg>::processSmallTasks(const iterator begin, SharedData& shared) {
-    std::size_t my_index = shared.small_task_index.fetch_add(1, std::memory_order_relaxed);
-    while (my_index < shared.small_tasks.size()) {
-        const auto my_task = shared.small_tasks[my_index];
-        sequential(begin + my_task.begin, begin + my_task.end);
-        my_index = shared.small_task_index.fetch_add(1, std::memory_order_relaxed);
+void Sorter<Cfg>::processSmallTasks(const iterator begin, int num_threads) {
+    auto& scheduler = shared_->scheduler;
+    auto& my_queue = local_.seq_task_queue;
+    auto extractor = classifier_->getExtractor();
+    auto comp = [&extractor](auto&& l, auto&& r) { return extractor(l) < extractor(r); };
+
+    Task task;
+
+    while (scheduler.getJob(my_queue, task)) {
+        scheduler.offerJob(my_queue);
+        if (!detail::smallestSortIfAtMostThreshold<Cfg::kSmallestSortSize>(
+                    begin + task.begin, begin + task.end, comp)) {
+            sequential(begin, task, my_queue);
+        }
     }
+}
+
+template <class Cfg>
+void Sorter<Cfg>::queueTasks(const int level, const diff_t stripe, const int id,
+                             const int task_num_threads, const diff_t parent_task_size,
+                             const diff_t offset, const diff_t* bucket_start) {
+    const diff_t parent_task_stripe =
+            (parent_task_size + task_num_threads - 1) / task_num_threads;
+
+    const auto queueTask = [&](const diff_t task_begin, const diff_t task_end,
+                               int level) {
+        const int thread_begin = (offset + task_begin + stripe / 2) / stripe;
+        const int thread_end = (offset + task_end + stripe / 2) / stripe;
+
+        const auto task_size = task_end - task_begin;
+
+        if (thread_end - thread_begin <= 1
+            || task_end - task_begin <= Cfg::kBaseCaseSize) {
+            const auto thread = (task_begin + task_size / 2) / parent_task_stripe;
+
+            shared_->local[id + thread]->seq_task_queue.emplace(offset + task_begin,
+                                                                offset + task_end, level);
+
+        } else {
+            shared_->thread_pools[thread_begin] =
+                    std::make_shared<SubThreadPool>(thread_end - thread_begin);
+
+            for (auto t = thread_begin; t != thread_end; ++t) {
+                auto& bt = shared_->big_tasks[t];
+
+                bt.begin = offset + task_begin;
+                bt.end = offset + task_end;
+                bt.level = level;
+                bt.task_thread_id = t - thread_begin;
+                bt.root_thread = thread_begin;
+                bt.has_task = true;
+            }
+        }
+    };
+
+    for (auto t = id; t != id + task_num_threads; ++t) {
+        shared_->big_tasks[t].has_task = false;
+    }
+
+    // Queue subtasks if we didn't reach the last level yet
+    if (!isLastLevel(level)) {
+        std::vector<detail::Task> tasks;
+
+        // Skip equality buckets
+        for (int i = Cfg::kMaxBuckets - 1; i >= 0; --i) {
+            const auto start = bucket_start[i];
+            const auto stop = bucket_start[i + 1];
+            queueTask(start, stop, level + 1);
+        }
+    }
+}
+
+/**
+ * Process a big task with multiple threads in the parallel algorithm.
+ */
+template <class Cfg>
+void Sorter<Cfg>::processBigTasks(const iterator begin, const diff_t stripe, const int id,
+                                  BufferStorage& buffer_storage,
+                                  std::vector<std::shared_ptr<SubThreadPool>>& tp_trash) {
+    BigTask& task = shared_->big_tasks[id];
+
+    while (task.has_task) {
+        if (task.root_thread == id) {
+            // Only thread 0 passes a task sorter (the one stored in this
+            // object). The other threads have to create a task sorter if
+            // required.
+            processBigTaskPrimary(begin, stripe, id, buffer_storage, tp_trash);
+        } else {
+            processBigTasksSecondary(id, buffer_storage);
+        }
+    }
+}
+
+template <class Cfg>
+void Sorter<Cfg>::setShared(SharedData* shared) {
+    shared_ = shared;
+}
+
+/**
+ * Process a big task with multiple threads in the parallel algorithm.
+ */
+template <class Cfg>
+void Sorter<Cfg>::processBigTasksSecondary(const int id, BufferStorage& buffer_storage) {
+    BigTask& task = shared_->big_tasks[id];
+    auto partial_thread_pool = shared_->thread_pools[task.root_thread];
+
+    partial_thread_pool->join(task.task_thread_id);
+}
+
+/**
+ * Process a big task with multiple threads in the parallel algorithm.
+ */
+template <class Cfg>
+void Sorter<Cfg>::processBigTaskPrimary(
+        const iterator begin, const diff_t stripe, const int id,
+        BufferStorage& buffer_storage,
+        std::vector<std::shared_ptr<SubThreadPool>>& tp_trash) {
+    BigTask& task = shared_->big_tasks[id];
+
+    // Thread pool of this task.
+    auto partial_thread_pool = shared_->thread_pools[id];
+
+    using Sorter = Sorter<
+            ExtendedConfig<iterator, typename Cfg::Extractor, Config<>, SubThreadPool>>;
+
+    // Create shared data.
+    detail::AlignedPtr<typename Sorter::SharedData> partial_shared_ptr(
+            Cfg::kDataAlignment, shared_->classifier.getExtractor(),
+            partial_thread_pool->sync(), partial_thread_pool->numThreads());
+    auto& partial_shared = partial_shared_ptr.get();
+
+    // Create local data.
+    typename Sorter::BufferStorage partial_buffer_storage(
+            partial_thread_pool->numThreads());
+    std::unique_ptr<detail::AlignedPtr<typename Sorter::LocalData>[]> partial_local_ptrs(
+            new detail::AlignedPtr<
+                    typename Sorter::LocalData>[partial_thread_pool->numThreads()]);
+
+    for (int i = 0; i != partial_thread_pool->numThreads(); ++i) {
+        partial_local_ptrs[i] = detail::AlignedPtr<typename Sorter::LocalData>(
+                Cfg::kDataAlignment, shared_->classifier.getExtractor(),
+                buffer_storage.forThread(task.root_thread + i));
+        partial_shared.local[i] = &partial_local_ptrs[i].get();
+    }
+
+    // todo vector of size 255
+    std::vector<diff_t> offsets;
+
+    // Execute in parallel
+    partial_thread_pool->operator()(
+            [&partial_shared, begin, &task, &offsets, level_end = this->level_end_](
+                    int partial_id, int partial_num_threads) {
+                Sorter sorter(*partial_shared.local[partial_id]);
+                sorter.setShared(&partial_shared);
+                if (partial_id == 0) {
+                    offsets = sorter.parallelPartitionPrimary(
+                            begin + task.begin, begin + task.end, task.level, level_end,
+                            partial_num_threads);
+                } else {
+                    sorter.parallelPartitionSecondary(
+                            begin + task.begin, begin + task.end, task.level, level_end,
+                            partial_id, partial_num_threads);
+                }
+            },
+            partial_thread_pool->numThreads());
+
+    // Move my thread pool to the trash as I might create a new one.
+    tp_trash.emplace_back(std::move(shared_->thread_pools[id]));
+
+    queueTasks(task.level, stripe, id, partial_thread_pool->numThreads(),
+               task.end - task.begin, task.begin, offsets.data());
+
+    partial_thread_pool->release_threads();
+}
+
+/**
+ * Entry point to execute a single partitioning recursion step with
+ * secondary threads.
+ */
+template <class Cfg>
+void Sorter<Cfg>::parallelPartitionSecondary(const iterator begin, const iterator end,
+                                             const int level, const int level_end, int id,
+                                             int num_threads) {
+    shared_->local[id] = &local_;
+    level_end_ = level_end;
+    partition<true>(begin, end, level, shared_->bucket_start, id, num_threads);
+    shared_->sync.barrier();
+}
+
+/**
+ * Entry point to execute a single partitioning recursion step with
+ * the first thread.
+ */
+template <class Cfg>
+std::vector<typename Sorter<Cfg>::diff_t> Sorter<Cfg>::parallelPartitionPrimary(
+        const iterator begin, const iterator end, const int level, const int level_end,
+        const int num_threads) {
+    const auto size = end - begin;
+    level_end_ = level_end;
+
+    partition<true>(begin, end, level, shared_->bucket_start, 0, num_threads);
+
+    std::vector<diff_t> bucket_start(shared_->bucket_start,
+                                     shared_->bucket_start + Cfg::kMaxBuckets + 1);
+
+    shared_->reset();
+    shared_->sync.barrier();
+
+    return bucket_start;
 }
 
 /**
  * Main loop for secondary threads in the parallel algorithm.
  */
 template <class Cfg>
-void Sorter<Cfg>::parallelSecondary(SharedData& shared, int id, int num_threads) {
-    const auto begin = shared.begin_;
-    shared.local[id] = &local_;
-    do {
-        const auto task = shared.big_tasks.back();
-        partition<true>(begin + task.begin, begin + task.end, shared.bucket_start, &shared, id, num_threads);
-        shared.sync.barrier();
-    } while (!shared.big_tasks.empty());
+void Sorter<Cfg>::parallelSortSecondary(
+        const iterator begin, const iterator end, int id, int num_threads,
+        BufferStorage& buffer_storage,
+        std::vector<std::shared_ptr<SubThreadPool>>& tp_trash, int level_begin,
+        int level_end) {
+    this->level_end_ = level_end;
 
-    processSmallTasks(begin, shared);
+    shared_->local[id] = &local_;
+
+    partition<true>(begin, end, level_begin, shared_->bucket_start, id, num_threads);
+    shared_->sync.barrier();
+
+    const auto stripe = ((end - begin) + num_threads - 1) / num_threads;
+    processBigTasks(begin, stripe, id, buffer_storage, tp_trash);
+    processSmallTasks(begin, num_threads);
 }
 
 /**
  * Main loop for the primary thread in the parallel algorithm.
  */
 template <class Cfg>
-template <class TaskSorter>
-void Sorter<Cfg>::parallelPrimary(const iterator begin, const iterator end,
-                                  SharedData& shared, const int num_threads,
-                                  TaskSorter&& task_sorter) {
-    const auto max_sequential_size = [&] {
-        const auto div = (end - begin) / num_threads;
-        const auto blocks = num_threads * Cfg::kMinParallelBlocksPerThread * Cfg::kBlockSize;
-        return std::max(div, blocks);
-    }();
+void Sorter<Cfg>::parallelSortPrimary(
+        const iterator begin, const iterator end, const int num_threads,
+        BufferStorage& buffer_storage,
+        std::vector<std::shared_ptr<SubThreadPool>>& tp_trash, int level_begin,
+        int level_end) {
+    this->level_end_ = level_end;
 
-    shared.small_tasks.clear();
-    shared.small_task_index.store(0, std::memory_order_relaxed);
-    // Queues a subtask either as a big task, a small task, or not at all, depending on the size
-    const auto queueTask = [&shared, max_sequential_size](int i, std::ptrdiff_t offset, int level) {
-        const auto start = offset + shared.bucket_start[i];
-        const auto stop = offset + shared.bucket_start[i + 1];
-        if (stop - start > max_sequential_size) {
-            shared.big_tasks.push_back({start, stop, level});
-        } else if (stop - start > 2 * Cfg::kBaseCaseSize) {
-            shared.small_tasks.push_back({start, stop, level});
-        }
-    };
+    partition<true>(begin, end, level_begin, shared_->bucket_start, 0, num_threads);
 
-    do {
-        // Do parallel partitioning
-        const auto task = shared.big_tasks.back();
-        const auto res = partition<true>(begin + task.begin, begin + task.end,
-                                         shared.bucket_start, &shared, 0, num_threads);
-        const int num_buckets = std::get<0>(res);
-        const bool equal_buckets = std::get<1>(res);
-        shared.big_tasks.pop_back();
+    const bool is_last_level = isLastLevel(level_begin);
+    const auto stripe = ((end - begin) + num_threads - 1) / num_threads;
+    if (!is_last_level) {
+        queueTasks(level_begin, stripe, 0, num_threads, end - begin, begin - begin,
+                   shared_->bucket_start);
+    }
 
-        // Queue subtasks if we didn't reach the last level yet
-        const bool is_last_level = end_ - begin_ <= Cfg::kSingleLevelThreshold;
-        if (!is_last_level) {
-            // Skip equality buckets
-            for (int i = 0; i < num_buckets; i += 1 + equal_buckets)
-                queueTask(i, task.begin, task.level + 1);
-            if (equal_buckets)
-                queueTask(num_buckets - 1, task.begin, task.level + 1);
-        }
-        if (shared.big_tasks.empty()) {
-            // Sort small tasks by size, larger ones first
-            task_sorter(shared.small_tasks.begin(), shared.small_tasks.end());
-        }
+    shared_->reset();
+    shared_->sync.barrier();
 
-        shared.reset();
-        shared.sync.barrier();
-    } while (!shared.big_tasks.empty());
-
-    // Process remaining small tasks
-    processSmallTasks(begin, shared);
+    processBigTasks(begin, stripe, 0, buffer_storage, tp_trash);
+    processSmallTasks(begin, num_threads);
 }
 
 }  // namespace detail
@@ -148,23 +333,26 @@ template <class Cfg>
 class ParallelSorter {
     using Sorter = detail::Sorter<Cfg>;
     using iterator = typename Cfg::iterator;
+    using key_type = typename Cfg::key_type;
 
  public:
     /**
      * Construct the sorter. Thread pool may be passed by reference.
      */
-    ParallelSorter(typename Cfg::less comp, typename Cfg::ThreadPool thread_pool)
-            : thread_pool_(std::forward<typename Cfg::ThreadPool>(thread_pool))
-            , shared_ptr_(Cfg::kDataAlignment, std::move(comp), thread_pool_.sync(), thread_pool_.numThreads())
-            , buffer_storage_(thread_pool_.numThreads())
-            , local_ptrs_(new detail::AlignedPtr<typename Sorter::LocalData>[thread_pool_.numThreads()])
-            , task_sorter_(false, {}, buffer_storage_.forThread(0))
-    {
-        // Allocate local data
+    ParallelSorter(typename Cfg::Extractor extractor,
+                   typename Cfg::ThreadPool thread_pool)
+        : thread_pool_(std::forward<typename Cfg::ThreadPool>(thread_pool))
+        , shared_ptr_(Cfg::kDataAlignment, std::move(extractor), thread_pool_.sync(),
+                      thread_pool_.numThreads())
+        , buffer_storage_(thread_pool_.numThreads())
+        , local_ptrs_(new detail::AlignedPtr<
+                      typename Sorter::LocalData>[thread_pool_.numThreads()]) {
+        // Allocate local data and reuse memory of the previous recursion level
         thread_pool_([this](int my_id, int) {
             auto& shared = this->shared_ptr_.get();
             this->local_ptrs_[my_id] = detail::AlignedPtr<typename Sorter::LocalData>(
-                            Cfg::kDataAlignment, shared.classifier.getComparator(), buffer_storage_.forThread(my_id));
+                    Cfg::kDataAlignment, shared.classifier.getExtractor(),
+                    buffer_storage_.forThread(my_id));
             shared.local[my_id] = &this->local_ptrs_[my_id].get();
         });
     }
@@ -175,25 +363,65 @@ class ParallelSorter {
     void operator()(iterator begin, iterator end) {
         // Sort small input sequentially
         const int num_threads = Cfg::numThreadsFor(begin, end, thread_pool_.numThreads());
-        if (num_threads < 2) {
+        if (num_threads < 2 || end - begin <= Cfg::kSmallestSortSize) {
             Sorter(local_ptrs_[0].get()).sequential(std::move(begin), std::move(end));
             return;
         }
 
         // Set up base data before switching to parallel mode
         auto& shared = shared_ptr_.get();
-        shared.begin_ = begin;
-        shared.big_tasks.push_back({0, end - begin, 1});
+        // shared.begin_ = begin;
 
         // Execute in parallel
-        thread_pool_([this, begin, end](int my_id, int num_threads) {
-            auto& shared = this->shared_ptr_.get();
-            Sorter sorter(*shared.local[my_id]);
-            if (my_id == 0)
-                sorter.parallelPrimary(begin, end, shared, num_threads, task_sorter_);
-            else
-                sorter.parallelSecondary(shared, my_id, num_threads);
-        }, num_threads);
+        Sorter primary_sorter(*shared.local[0]);
+        int level_begin = 0;
+        int level_end = 0;
+
+        std::tie(level_begin, level_end) = primary_sorter.sampleLevels(begin, end);
+        const bool adjust_levels = level_begin != 0 || level_end != sizeof(key_type);
+
+        // Vector to aggregate differing bits of different stripes (used
+        // in function function parallelGetLevels).
+        std::vector<typename Cfg::key_type> differing_bits(thread_pool_.numThreads());
+        // Vector to store whether stripes of the input are sorted (used
+        // in function function parallelGetLevels).
+        std::vector<bool> sorted_store(thread_pool_.numThreads());
+
+        thread_pool_(
+                [this, &primary_sorter, &shared, &differing_bits, &sorted_store, begin,
+                 end, &level_begin, &level_end,
+                 adjust_levels](int my_id, int num_threads) {
+                    std::vector<std::shared_ptr<typename Sorter::SubThreadPool>> tp_trash;
+
+                    if (my_id == 0) {
+                        if (adjust_levels) {
+                            std::tie(level_begin, level_end) =
+                                    primary_sorter.parallelGetLevels(
+                                            begin, end, differing_bits, sorted_store,
+                                            my_id, num_threads);
+                            shared.sync.barrier();
+                            if (level_begin >= level_end) return;
+                        }
+                        primary_sorter.setShared(&shared);
+                        primary_sorter.parallelSortPrimary(begin, end, num_threads,
+                                                           buffer_storage_, tp_trash,
+                                                           level_begin, level_end);
+                    } else {
+                        auto& shared = this->shared_ptr_.get();
+                        Sorter sorter(*shared.local[my_id]);
+                        if (adjust_levels) {
+                            sorter.parallelGetLevels(begin, end, differing_bits,
+                                                     sorted_store, my_id, num_threads);
+                            shared.sync.barrier();
+                            if (level_begin >= level_end) return;
+                        }
+                        sorter.setShared(&shared);
+                        sorter.parallelSortSecondary(begin, end, my_id, num_threads,
+                                                     buffer_storage_, tp_trash,
+                                                     level_begin, level_end);
+                    }
+                },
+                num_threads);
     }
 
  private:
@@ -201,11 +429,7 @@ class ParallelSorter {
     detail::AlignedPtr<typename Sorter::SharedData> shared_ptr_;
     typename Sorter::BufferStorage buffer_storage_;
     std::unique_ptr<detail::AlignedPtr<typename Sorter::LocalData>[]> local_ptrs_;
-    SequentialSorter<ExtendedConfig<
-                std::vector<detail::ParallelTask>::iterator,
-                std::greater<>, typename Cfg::BaseConfig
-                       >> task_sorter_;
 };
 
-}  // namespace ips4o
-#endif  // _REENTRANT || _OPENMP
+}  // namespace ips2ra
+#endif  // _REENTRANT

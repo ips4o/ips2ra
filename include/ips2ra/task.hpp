@@ -1,5 +1,5 @@
 /******************************************************************************
- * include/ips2ra/utils.hpp
+ * include/ips2ra/task.hpp
  *
  * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
@@ -35,36 +35,24 @@
 
 #pragma once
 
-#include <cassert>
-
-#define IPS2RA_ASSUME_NOT(c) if (c) __builtin_unreachable()
-#define IPS2RA_IS_NOT(c) assert(!(c))
-
-#include <limits>
+#include <cstddef>
 
 namespace ips2ra {
 namespace detail {
 
 /**
- * Compute the logarithm to base 2, rounded down.
+ * A subtask in the parallel algorithm.
+ * Uses indices instead of iterators to avoid unnecessary template instantiations.
  */
-inline constexpr unsigned long log2(unsigned long n) {
-    return (std::numeric_limits<unsigned long>::digits - 1 - __builtin_clzl(n));
-}
+struct Task {
+    Task() {}
+    Task(std::ptrdiff_t begin, std::ptrdiff_t end, int level)
+        : begin(begin), end(end), level(level) {}
 
-template <int tmpl_idx, int last, class E, typename... Ts>
-void switchUnroll(E& e, int idx, Ts... args) {
-    assert(idx <= last);
-    if constexpr (tmpl_idx > last)
-        return;
-    else if constexpr (tmpl_idx < 0)
-        return;
-    else if (idx == tmpl_idx) {
-        e.template operator()<tmpl_idx>(args...);
-    } else {
-        switchUnroll<tmpl_idx + 1, last>(e, idx, args...);
-    }
-}
+    std::ptrdiff_t begin;
+    std::ptrdiff_t end;
+    int level;
+};
 
 }  // namespace detail
 }  // namespace ips2ra

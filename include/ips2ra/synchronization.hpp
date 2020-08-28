@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/synchronization.hpp
+ * include/ips2ra/synchronization.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -34,12 +34,12 @@
  *****************************************************************************/
 
 #pragma once
-#ifdef _REENTRANT
+#if defined(_REENTRANT)
 
 #include <condition_variable>
 #include <mutex>
 
-namespace ips4o {
+namespace ips2ra {
 namespace detail {
 
 /**
@@ -136,5 +136,5 @@ void Sync::critical(F&& func) {
 }
 
 }  // namespace detail
-}  // namespace ips4o
-#endif  // _REENTRANT
+}  // namespace ips2ra
+#endif  // defined(_REENTRANT)

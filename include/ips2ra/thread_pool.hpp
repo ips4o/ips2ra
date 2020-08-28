@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/thread_pool.hpp
+ * include/ips2ra/thread_pool.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -36,10 +36,13 @@
 #pragma once
 #ifdef _OPENMP
 #include <omp.h>
+
+#include "synchronization.hpp"
 #endif  // _OPENMP
 
 #ifdef _REENTRANT
 #include <algorithm>
+#include <cassert>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -48,13 +51,14 @@
 #include "synchronization.hpp"
 #endif  // _REENTRANT
 
-namespace ips4o {
+namespace ips2ra {
 
 #ifdef _OPENMP
 
 /**
  * A thread pool using OpenMP.
  */
+
 class OpenMPThreadPool {
  public:
     class Sync {
@@ -64,8 +68,8 @@ class OpenMPThreadPool {
         }
 
 #ifdef __INTEL_COMPILER
-        // Workaround: icc with OpenMP fails here when using lambdas as template parameter
-        void single(std::function<void()> func) const {
+        // Workaround: icc with OpenMP fails here when using lambdas as
+        template parameter void single(std::function<void()> func) const {
 #else
         template <class F>
         void single(F&& func) const {
@@ -82,18 +86,22 @@ class OpenMPThreadPool {
     };
 
     explicit OpenMPThreadPool(int num_threads = OpenMPThreadPool::maxNumThreads())
-            : num_threads_(num_threads) {}
+        : num_threads_(num_threads) {}
 
     /**
-    * Entry point for parallel execution.
-    */
+     * Entry point for parallel execution.
+     */
     template <class F>
     void operator()(F&& func, int num_threads = std::numeric_limits<int>::max()) {
         num_threads = std::min(num_threads, num_threads_);
         if (num_threads > 1)
 #pragma omp parallel num_threads(num_threads)
-            func(omp_get_thread_num(), omp_get_num_threads());
-        else
+        {
+            int my_id = omp_get_thread_num();
+            int threads = omp_get_num_threads();
+
+            func(my_id, threads);
+        } else
             func(0, 1);
     }
 
@@ -109,7 +117,6 @@ class OpenMPThreadPool {
 
 #endif  // _OPENMP
 
-
 #ifdef _REENTRANT
 
 /**
@@ -120,7 +127,7 @@ class StdThreadPool {
     using Sync = detail::Sync;
 
     explicit StdThreadPool(int num_threads = StdThreadPool::maxNumThreads())
-            : impl_(new Impl(num_threads)) {}
+        : impl_(new Impl(num_threads)) {}
 
     template <class F>
     void operator()(F&& func, int num_threads = std::numeric_limits<int>::max()) {
@@ -146,66 +153,176 @@ class StdThreadPool {
         int num_threads_;
         bool done_ = false;
 
-        /**
-        * Constructor for the std::thread pool.
-        */
-        Impl(int num_threads)
-            : sync_(std::max(1, num_threads))
-            , pool_barrier_(std::max(1, num_threads))
-            , num_threads_(std::max(1, num_threads))
-        {
-            threads_.reserve(num_threads_ - 1);
-            for (int i = 1; i < num_threads_; ++i)
-                threads_.emplace_back(&Impl::main, this, i);
-        }
+        Impl(int num_threads);
+        ~Impl();
 
-        /**
-         * Destructor for the std::thread pool.
-         */
-        ~Impl() {
-            done_ = true;
-            pool_barrier_.barrier();
-            for (auto& t : threads_)
-                t.join();
-        }
-
-        /**
-        * Entry point for parallel execution for the std::thread pool.
-        */
         template <class F>
-        void run(F&& func, const int num_threads) {
-            func_ = func;
-            num_threads_ = num_threads;
-            sync_.setNumThreads(num_threads);
+        inline void run(F&& func, const int num_threads);
 
-            pool_barrier_.barrier();
-            func_(0, num_threads);
-            pool_barrier_.barrier();
-        }
-
-        /**
-        * Main loop for threads created by the std::thread pool.
-        */
-        void main(const int my_id) {
-            for (;;) {
-                pool_barrier_.barrier();
-                if (done_) break;
-                if (my_id < num_threads_)
-                    func_(my_id, num_threads_);
-                pool_barrier_.barrier();
-            }
-        }
+        inline void main(const int my_id);
     };
 
     std::unique_ptr<Impl> impl_;
 };
 
+/**
+ * Constructor for the std::thread pool.
+ */
+StdThreadPool::Impl::Impl(int num_threads)
+    : sync_(std::max(1, num_threads))
+    , pool_barrier_(std::max(1, num_threads))
+    , num_threads_(num_threads)
+{
+    num_threads = std::max(1, num_threads);
+    threads_.reserve(num_threads - 1);
+    for (int i = 1; i < num_threads; ++i)
+        threads_.emplace_back(&Impl::main, this, i);
+}
+
+/**
+ * Destructor for the std::thread pool.
+ */
+StdThreadPool::Impl::~Impl() {
+    done_ = true;
+    pool_barrier_.barrier();
+    for (auto& t : threads_)
+        t.join();
+}
+
+/**
+ * Entry point for parallel execution for the std::thread pool.
+ */
+template <class F>
+void StdThreadPool::Impl::run(F&& func, int num_threads) {
+    func_ = func;
+    num_threads_ = num_threads;
+    sync_.setNumThreads(num_threads);
+
+    pool_barrier_.barrier();
+    func_(0, num_threads);
+    pool_barrier_.barrier();
+}
+
+/**
+ * Main loop for threads created by the std::thread pool.
+ */
+void StdThreadPool::Impl::main(const int my_id) {
+    for (;;) {
+        pool_barrier_.barrier();
+        if (done_) break;
+        if (my_id < num_threads_)
+            func_(my_id, num_threads_);
+        pool_barrier_.barrier();
+    }
+}
+
 #endif  // _REENTRANT
 
-#ifdef _OPENMP
+#if defined(_REENTRANT)
+
+/**
+ * A thread pool to which external threads can join.
+ */
+class ThreadJoiningThreadPool {
+ public:
+    using Sync = detail::Sync;
+
+    explicit ThreadJoiningThreadPool(int num_threads) : impl_(new Impl(num_threads)) {
+        assert(num_threads >= 2);
+    }
+
+    void join(int my_id) { impl_->join(my_id); }
+
+    void release_threads() { impl_->release_threads(); }
+
+    template <class F>
+    void operator()(F&& func, int num_threads = std::numeric_limits<int>::max()) {
+        num_threads = std::min(num_threads, numThreads());
+        if (num_threads > 1)
+            impl_->run(std::forward<F>(func), num_threads);
+        else
+            func(0, 1);
+    }
+
+    Sync& sync() { return impl_.get()->sync_; }
+
+    int numThreads() const { return impl_.get()->num_threads_; }
+
+ private:
+    struct Impl {
+        Sync sync_;
+        detail::Barrier pool_barrier_;
+        std::function<void(int, int)> func_;
+        int num_threads_;
+        bool done_ = false;
+
+        Impl(int num_threads);
+        ~Impl();
+
+        template <class F>
+        inline void run(F&& func, const int num_threads);
+
+        inline void join(int my_id);
+        inline void release_threads();
+
+        inline void main(const int my_id);
+    };
+
+    std::unique_ptr<Impl> impl_;
+};
+
+/**
+ * Constructor for the std::thread pool.
+ */
+ThreadJoiningThreadPool::Impl::Impl(int num_threads)
+    : sync_(num_threads), pool_barrier_(num_threads), num_threads_(num_threads) {}
+
+/**
+ * Destructor for the std::thread pool.
+ */
+ThreadJoiningThreadPool::Impl::~Impl() { assert(done_ == true); }
+
+/**
+ * Entry point for parallel execution for the std::thread pool.
+ */
+template <class F>
+void ThreadJoiningThreadPool::Impl::run(F&& func, int num_threads) {
+    func_ = func;
+    num_threads_ = num_threads;
+    sync_.setNumThreads(num_threads);
+
+    pool_barrier_.barrier();
+    func_(0, num_threads);
+    pool_barrier_.barrier();
+}
+
+/**
+ * Main loop for threads which have joined.
+ */
+void ThreadJoiningThreadPool::Impl::main(const int my_id) {
+    for (;;) {
+        pool_barrier_.barrier();
+        if (done_) break;
+        if (my_id < num_threads_) func_(my_id, num_threads_);
+        pool_barrier_.barrier();
+    }
+}
+
+void ThreadJoiningThreadPool::Impl::join(int my_id) { main(my_id); }
+
+void ThreadJoiningThreadPool::Impl::release_threads() {
+    done_ = true;
+    pool_barrier_.barrier();
+}
+
+#endif  // defined(_REENTRANT)
+
+#if defined(_REENTRANT) && defined(_OPENMP)
 using DefaultThreadPool = OpenMPThreadPool;
 #elif defined(_REENTRANT)
 using DefaultThreadPool = StdThreadPool;
+#else
+#error No Default Thread Pool Defined
 #endif
 
-}  // namespace ips4o
+}  // namespace ips2ra

@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/memory.hpp
+ * include/ips2ra/memory.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -37,18 +37,24 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <random>
 #include <utility>
 #include <vector>
 
-#include "ips4o_fwd.hpp"
+#include <tbb/concurrent_queue.h>
+
+#include "ips2ra_fwd.hpp"
 #include "bucket_pointers.hpp"
 #include "buffers.hpp"
 #include "classifier.hpp"
+#include "config.hpp"
+#include "scheduler.hpp"
 
-namespace ips4o {
+namespace ips2ra {
 namespace detail {
 
 /**
@@ -71,9 +77,8 @@ class AlignedPtr {
 
     template <class... Args>
     explicit AlignedPtr(std::size_t alignment, Args&&... args)
-            : alloc_(new char[sizeof(T) + alignment])
-            , value_(new (alignPointer(alloc_, alignment)) T(std::forward<Args>(args)...))
-    {}
+        : alloc_(new char[sizeof(T) + alignment])
+        , value_(new (alignPointer(alloc_, alignment)) T(std::forward<Args>(args)...)) {}
 
     AlignedPtr(const AlignedPtr&) = delete;
     AlignedPtr& operator=(const AlignedPtr&) = delete;
@@ -94,9 +99,7 @@ class AlignedPtr {
         }
     }
 
-    T& get() {
-        return *value_;
-    }
+    T& get() { return *value_; }
 
  private:
     char* alloc_ = nullptr;
@@ -113,9 +116,7 @@ class AlignedPtr<void> {
 
     template <class... Args>
     explicit AlignedPtr(std::size_t alignment, std::size_t size)
-            : alloc_(new char[size + alignment])
-            , value_(alignPointer(alloc_, alignment))
-    {}
+        : alloc_(new char[size + alignment]), value_(alignPointer(alloc_, alignment)) {}
 
     AlignedPtr(const AlignedPtr&) = delete;
     AlignedPtr& operator=(const AlignedPtr&) = delete;
@@ -130,14 +131,10 @@ class AlignedPtr<void> {
     }
 
     ~AlignedPtr() {
-        if (alloc_) {
-            delete[] alloc_;
-        }
+        if (alloc_) { delete[] alloc_; }
     }
 
-    char* get() {
-        return value_;
-    }
+    char* get() { return value_; }
 
  private:
     char* alloc_ = nullptr;
@@ -149,10 +146,9 @@ class AlignedPtr<void> {
  */
 template <class Cfg>
 class Sorter<Cfg>::BufferStorage : public AlignedPtr<void> {
-    static constexpr const auto kPerThread =
-            Cfg::kBlockSizeInBytes * Cfg::kMaxBuckets * (1 + Cfg::kAllowEqualBuckets);
-
  public:
+    static constexpr const auto kPerThread = Cfg::kBlockSizeInBytes * Cfg::kMaxBuckets;
+
     BufferStorage() {}
 
     explicit BufferStorage(int num_threads)
@@ -167,6 +163,7 @@ class Sorter<Cfg>::BufferStorage : public AlignedPtr<void> {
 template <class Cfg>
 struct Sorter<Cfg>::LocalData {
     using diff_t = typename Cfg::difference_type;
+
     // Buffers
     diff_t bucket_size[Cfg::kMaxBuckets];
     Buffers buffers;
@@ -175,6 +172,7 @@ struct Sorter<Cfg>::LocalData {
 
     // Bucket information
     BucketPointers bucket_pointers[Cfg::kMaxBuckets];
+    PrivateQueue<Task> seq_task_queue;
 
     // Classifier
     Classifier classifier;
@@ -185,15 +183,16 @@ struct Sorter<Cfg>::LocalData {
 
     // Random bit generator for sampling
     // LCG using constants by Knuth (for 64 bit) or Numerical Recipes (for 32 bit)
-    std::linear_congruential_engine<std::uintptr_t,
-                                    Cfg::kIs64Bit ? 6364136223846793005u : 1664525u,
-                                    Cfg::kIs64Bit ? 1442695040888963407u : 1013904223u,
-                                    0u> random_generator;
+    std::linear_congruential_engine<
+            std::uintptr_t, Cfg::kIs64Bit ? 6364136223846793005u : 1664525u,
+            Cfg::kIs64Bit ? 1442695040888963407u : 1013904223u, 0u>
+            random_generator;
 
-    LocalData(typename Cfg::less comp, char* buffer_storage)
-            : buffers(buffer_storage)
-            , classifier(std::move(comp))
-    {
+    // Offsets for the base case algorithm
+    std::ptrdiff_t offs[2 * (Cfg::kBaseCaseSize + 1)];
+
+    LocalData(typename Cfg::Extractor extractor, char* buffer_storage)
+        : buffers(buffer_storage), classifier(std::move(extractor)) {
         std::random_device rdev;
         std::ptrdiff_t seed = rdev();
         if (Cfg::kIs64Bit)
@@ -205,27 +204,25 @@ struct Sorter<Cfg>::LocalData {
     /**
      * Resets local data after partitioning is done.
      */
-    void reset() {
-        classifier.reset();
-        std::fill_n(bucket_size, Cfg::kMaxBuckets, 0);
-    }
+    void reset() { std::fill_n(bucket_size, Cfg::kMaxBuckets, 0); }
 };
 
 /**
- * A subtask in the parallel algorithm.
- * Uses indices instead of iterators to avoid unnecessary template instantiations.
+ * Data describing a parallel task and the corresponding threads.
  */
-struct ParallelTask {
+struct BigTask {
+    BigTask() : has_task{false} {}
+    // TODO or Cfg::iterator???
     std::ptrdiff_t begin;
     std::ptrdiff_t end;
+    // Index of the byte used for classification.
     int level;
-
-    bool operator==(const ParallelTask& rhs) const { return begin == rhs.begin && end == rhs.end; }
-    bool operator!=(const ParallelTask& rhs) const { return begin != rhs.begin || end != rhs.end; }
-    bool operator<(const ParallelTask& rhs) const { return end - begin < rhs.end - rhs.begin; }
-    bool operator<=(const ParallelTask& rhs) const { return end - begin <= rhs.end - rhs.begin; }
-    bool operator>(const ParallelTask& rhs) const { return end - begin > rhs.end - rhs.begin; }
-    bool operator>=(const ParallelTask& rhs) const { return end - begin >= rhs.end - rhs.begin; }
+    // My thread id of this task.
+    int task_thread_id;
+    // Index of the thread owning the thread pool used by this task.
+    int root_thread;
+    // Indicates whether this is a task or not
+    bool has_task;
 };
 
 /**
@@ -237,8 +234,6 @@ struct Sorter<Cfg>::SharedData {
     typename Cfg::difference_type bucket_start[Cfg::kMaxBuckets + 1];
     BucketPointers bucket_pointers[Cfg::kMaxBuckets];
     Block* overflow;
-    int num_buckets;
-    bool use_equal_buckets;
 
     // Classifier for parallel partitioning
     Classifier classifier;
@@ -249,17 +244,23 @@ struct Sorter<Cfg>::SharedData {
     // Local thread data
     std::vector<LocalData*> local;
 
-    // Parallel subtask information
-    typename Cfg::iterator begin_;
-    std::vector<ParallelTask> big_tasks;
-    std::vector<ParallelTask> small_tasks;
-    std::atomic_size_t small_task_index;
+    // Thread pools for bigtasks. One entry for each thread.
+    std::vector<std::shared_ptr<SubThreadPool>> thread_pools;
 
-    SharedData(typename Cfg::less comp, typename Cfg::Sync sync, std::size_t num_threads)
-        : classifier(std::move(comp))
+    // Bigtasks. One entry per thread.
+    std::vector<BigTask> big_tasks;
+
+    // Scheduler of small tasks.
+    Scheduler<Task> scheduler;
+
+    SharedData(typename Cfg::Extractor extractor, typename Cfg::Sync sync,
+               int num_threads)
+        : classifier(std::move(extractor))
         , sync(std::forward<typename Cfg::Sync>(sync))
         , local(num_threads)
-    {
+        , thread_pools(num_threads)
+        , big_tasks(num_threads)
+        , scheduler(num_threads) {
         reset();
     }
 
@@ -267,11 +268,11 @@ struct Sorter<Cfg>::SharedData {
      * Resets shared data after partitioning is done.
      */
     void reset() {
-        classifier.reset();
         std::fill_n(bucket_start, Cfg::kMaxBuckets + 1, 0);
         overflow = nullptr;
+        scheduler.reset();
     }
 };
 
 }  // namespace detail
-}  // namespace ips4o
+}  // namespace ips2ra

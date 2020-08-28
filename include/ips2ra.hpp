@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o.hpp
+ * include/ips2ra.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -35,4 +35,4 @@
 
 #pragma once
 
-#include "ips4o/ips4o.hpp"
+#include "ips2ra/ips2ra.hpp"

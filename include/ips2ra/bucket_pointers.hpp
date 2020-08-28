@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/bucket_pointers.hpp
+ * include/ips2ra/bucket_pointers.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -38,35 +38,133 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <mutex>
+#include <new>
+#include <tuple>
 #include <utility>
 
-#include "ips4o_fwd.hpp"
+#include "ips2ra_fwd.hpp"
 
-namespace ips4o {
+namespace ips2ra {
 namespace detail {
-
-#if UINTPTR_MAX != UINT32_MAX && !defined(__SIZEOF_INT128__)
-#error "Unsupported architecture"
-#endif
 
 template <class Cfg>
 class Sorter<Cfg>::BucketPointers {
-#if UINTPTR_MAX == UINT32_MAX
-    using atomic_type = std::uint64_t;
-#else
-    using atomic_type = unsigned __int128;
-#endif
-    static constexpr const int kShift = sizeof(atomic_type) * CHAR_BIT / 2;
-    static constexpr const atomic_type kMask = (static_cast<atomic_type>(1) << kShift) - 1;
     using diff_t = typename Cfg::difference_type;
+
+#if UINTPTR_MAX == UINT32_MAX || defined(__SIZEOF_INT128__)
+
+#if UINTPTR_MAX == UINT32_MAX
+
+    using atomic_type = std::uint64_t;
+
+#elif defined(__SIZEOF_INT128__)
+
+    using atomic_type = unsigned __int128;
+
+#endif  // defined(__SIZEOF_INT128__)
+
+    // alignas(std::hardware_destructive_interference_size)
+    class Uint128 {
+     public:
+        inline void set(diff_t l, diff_t m) {
+            single_.m_ = m;
+            single_.l_ = l;
+        }
+
+        inline diff_t getLeastSignificant() const { return single_.l_; }
+
+        template <bool kAtomic>
+        inline std::pair<diff_t, diff_t> fetchSubMostSignificant(diff_t m) {
+            if (kAtomic) {
+                const atomic_type atom_m = static_cast<atomic_type>(m) << kShift;
+                const auto p = __atomic_fetch_sub(&all_, atom_m, __ATOMIC_RELAXED);
+                return {p & kMask, p >> kShift};
+            } else {
+                const auto tmp = single_.m_;
+                single_.m_ -= m;
+                return {single_.l_, tmp};
+            }
+        }
+
+        template <bool kAtomic>
+        inline std::pair<diff_t, diff_t> fetchAddLeastSignificant(diff_t l) {
+            if (kAtomic) {
+                const auto p = __atomic_fetch_add(&all_, l, __ATOMIC_RELAXED);
+                return {p & kMask, p >> kShift};
+            } else {
+                const auto tmp = single_.l_;
+                single_.l_ += l;
+                return {tmp, single_.m_};
+            }
+        }
+
+     private:
+        static constexpr const int kShift = sizeof(atomic_type) * CHAR_BIT / 2;
+        static constexpr const atomic_type kMask =
+                (static_cast<atomic_type>(1) << kShift) - 1;
+
+        struct Pointers {
+            diff_t l_, m_;
+        };
+        union {
+            atomic_type all_;
+            Pointers single_;
+        };
+    };
+
+#else
+
+    class Uint128 {
+     public:
+        inline void set(diff_t l, diff_t m) {
+            m_ = m;
+            l_ = l;
+        }
+
+        inline diff_t getLeastSignificant() const { return l_; }
+
+        template <bool kAtomic>
+        inline std::pair<diff_t, diff_t> fetchSubMostSignificant(diff_t m) {
+            if (kAtomic) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                std::pair<diff_t, diff_t> p{l_, m_};
+                m_ -= m;
+                return p;
+            } else {
+                const auto tmp = m_;
+                m_ -= m;
+                return {l_, tmp};
+            }
+        }
+
+        template <bool kAtomic>
+        inline std::pair<diff_t, diff_t> fetchAddLeastSignificant(diff_t l) {
+            if (kAtomic) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                std::pair<diff_t, diff_t> p{l_, m_};
+                l_ += l;
+                return p;
+            } else {
+                const auto tmp = l_;
+                l_ += l;
+                return {tmp, m_};
+            }
+        }
+
+     private:
+        diff_t m_, l_;
+        std::mutex mtx_;
+    };
+
+#endif
 
  public:
     /**
      * Sets write/read pointers.
      */
     void set(diff_t w, diff_t r) {
-        single_.w = w;
-        single_.r = r;
+        ptr_.set(w, r);
         num_reading_.store(0, std::memory_order_relaxed);
     }
 
@@ -74,7 +172,7 @@ class Sorter<Cfg>::BucketPointers {
      * Gets the write pointer.
      */
     diff_t getWrite() const {
-        return single_.w;
+        return ptr_.getLeastSignificant();
     }
 
     /**
@@ -82,20 +180,12 @@ class Sorter<Cfg>::BucketPointers {
      */
     template <bool kAtomic>
     std::pair<diff_t, diff_t> incWrite() {
-        if (kAtomic) {
-            const auto p = __atomic_fetch_add(&all_, Cfg::kBlockSize, __ATOMIC_RELAXED);
-            const diff_t w = p & kMask;
-            const diff_t r = (p >> kShift);
-            return {w, r};
-        } else {
-            const auto w = single_.w;
-            single_.w += Cfg::kBlockSize;
-            return {w, single_.r};
-        }
+        return ptr_.template fetchAddLeastSignificant<kAtomic>(Cfg::kBlockSize);
     }
 
     /**
-     * Gets write/read pointers, decreases the read pointer, and increases the read counter.
+     * Gets write/read pointers, decreases the read pointer, and increases the read
+     * counter.
      */
     template <bool kAtomic>
     std::pair<diff_t, diff_t> decRead() {
@@ -103,15 +193,11 @@ class Sorter<Cfg>::BucketPointers {
             // Must not be moved after the following fetch_sub, as that could lead to
             // another thread writing to our block, because isReading() returns false.
             num_reading_.fetch_add(1, std::memory_order_acquire);
-            const auto p = __atomic_fetch_sub(&all_,
-                    static_cast<atomic_type>(Cfg::kBlockSize) << kShift, __ATOMIC_RELAXED);
-            const diff_t w = p & kMask;
-            const diff_t r = (p >> kShift) & ~(Cfg::kBlockSize - 1);
-            return {w, r};
+            const auto p =
+                    ptr_.template fetchSubMostSignificant<kAtomic>(Cfg::kBlockSize);
+            return {p.first, p.second & ~(Cfg::kBlockSize - 1)};
         } else {
-            const auto r = single_.r;
-            single_.r -= Cfg::kBlockSize;
-            return {single_.w, r};
+            return ptr_.template fetchSubMostSignificant<kAtomic>(Cfg::kBlockSize);
         }
     }
 
@@ -119,7 +205,7 @@ class Sorter<Cfg>::BucketPointers {
      * Decreases the read counter.
      */
     void stopRead() {
-        // synchronizes with threads wanting to write to this bucket
+        // Synchronizes with threads wanting to write to this bucket
         num_reading_.fetch_sub(1, std::memory_order_release);
     }
 
@@ -127,18 +213,14 @@ class Sorter<Cfg>::BucketPointers {
      * Returns true if any thread is currently reading from here.
      */
     bool isReading() {
-        // synchronize with threads currently reading from this bucket
+        // Synchronizes with threads currently reading from this bucket
         return num_reading_.load(std::memory_order_acquire) != 0;
     }
 
  private:
-    struct Pointers { diff_t w, r; };
-    union {
-        atomic_type all_;
-        Pointers single_;
-    };
+    Uint128 ptr_;
     std::atomic_int num_reading_;
 };
 
 }  // namespace detail
-}  // namespace ips4o
+}  // namespace ips2ra

@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/sampling.hpp
+ * include/ips2ra/sampling.hpp // todo 
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra) // todo
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -33,18 +33,22 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *****************************************************************************/
 
+// todo rename file
+
 #pragma once
 
 #include <iterator>
 #include <random>
 #include <utility>
 
-#include "ips4o_fwd.hpp"
-#include "config.hpp"
+#include <tlx/math.hpp> // todo
+
+#include "ips2ra_fwd.hpp"
 #include "classifier.hpp"
+#include "config.hpp"
 #include "memory.hpp"
 
-namespace ips4o {
+namespace ips2ra {
 namespace detail {
 
 /**
@@ -54,70 +58,189 @@ template <class It, class RandomGen>
 void selectSample(It begin, const It end,
                   typename std::iterator_traits<It>::difference_type num_samples,
                   RandomGen&& gen) {
+    assert(end - begin >= num_samples);
     using std::swap;
 
     auto n = end - begin;
     while (num_samples--) {
-        const auto i = std::uniform_int_distribution<typename std::iterator_traits<It>::difference_type>(0, --n)(gen);
+        const auto i = std::uniform_int_distribution<
+                typename std::iterator_traits<It>::difference_type>(0, --n)(gen);
         swap(*begin, begin[i]);
         ++begin;
     }
 }
 
-/**
- * Builds the classifer.
- */
 template <class Cfg>
-std::pair<int, bool> Sorter<Cfg>::buildClassifier(const iterator begin,
-                                                  const iterator end,
-                                                  Classifier& classifier) {
+std::pair<int, int> Sorter<Cfg>::sampleLevels(const iterator begin, const iterator end) {
+    if (begin == end) return {0, 0};
+
     const auto n = end - begin;
-    int log_buckets = Cfg::logBuckets(n);
-    int num_buckets = 1 << log_buckets;
-    const auto step = std::max<diff_t>(1, Cfg::oversamplingFactor(n));
-    const auto num_samples = step * num_buckets - 1;
+    const auto oversampling = std::max<diff_t>(1, 0.25 * detail::log2(n));
+    const auto buckets = std::min<diff_t>(std::max<diff_t>(1, detail::log2(n)), 256);
+    const auto num_samples = oversampling * buckets;
+    assert(num_samples <= n);
 
     // Select the sample
     detail::selectSample(begin, end, num_samples, local_.random_generator);
 
-    // Sort the sample
-    sequential(begin, begin + num_samples);
-    auto splitter = begin + step - 1;
-    auto sorted_splitters = classifier.getSortedSplitters();
-    const auto comp = classifier.getComparator();
+    const typename Cfg::Extractor& extractor = local_.classifier.getExtractor();
+    key_type ref = extractor(*begin);
+    key_type differing_bits{0};
+    for (auto it = begin + 1; it != begin + num_samples; ++it) {
+        differing_bits |= ref ^ extractor(*it);
+    }
 
-    // Choose the splitters
-    IPS4O_ASSUME_NOT(sorted_splitters == nullptr);
-    new (sorted_splitters) typename Cfg::value_type(*splitter);
-    for (int i = 2; i < num_buckets; ++i) {
-        splitter += step;
-        // Skip duplicates
-        if (comp(*sorted_splitters, *splitter)) {
-            IPS4O_ASSUME_NOT(sorted_splitters + 1 == nullptr);
-            new (++sorted_splitters) typename Cfg::value_type(*splitter);
+    const int lz = tlx::clz(differing_bits);
+    const int tz = tlx::ctz(differing_bits);
+
+    return {lz / 8, sizeof(key_type) - tz / 8};
+}
+
+template <class Cfg>
+std::pair<int, int> Sorter<Cfg>::parallelGetLevels(const iterator begin,
+                                                   const iterator end,
+                                                   std::vector<key_type>& tmp,
+                                                   std::vector<bool>& sorted_tmp, int id,
+                                                   int num_threads) {
+    assert(tmp.size() == num_threads);
+    assert(sorted_tmp.size() == num_threads);
+
+    if (begin == end) return {0, 0};
+
+    const auto n = end - begin;
+    const auto stripe = tlx::div_ceil(n, num_threads);
+    const auto stripe_begin = begin + stripe * id;
+    const auto stripe_end = begin + std::min(n, stripe * (id + 1));
+
+    const typename Cfg::Extractor& extractor = local_.classifier.getExtractor();
+    key_type differing_bits{0};
+    key_type ref = extractor(*begin);
+
+    if (stripe_begin == stripe_end) {
+        sorted_tmp[id] = true;
+
+    } else if (extractor(*stripe_begin) <= extractor(*(stripe_end - 1))) {
+        // Calculate differing bits.
+        // As last element is not smaller than first element,
+        // test for sorted input (input is not reverse sorted).
+
+        bool my_sorted = true;
+        iterator it = stripe_begin;
+        for (; (it + 1) != stripe_end; ++it) {
+            differing_bits |= ref ^ extractor(*it);
+            my_sorted &= extractor(*it) <= extractor(*(it + 1));
         }
+        differing_bits |= ref ^ extractor(*it);
+
+        sorted_tmp[id] = my_sorted;
+
+    } else {
+        // Calculate differing bits.
+        // Check whether the input is reverse sorted.
+
+        iterator it = stripe_begin;
+        for (; it != stripe_end; ++it) { differing_bits |= ref ^ extractor(*it); }
+
+        sorted_tmp[id] = false;
     }
 
-    // Check for duplicate splitters
-    const auto diff_splitters = sorted_splitters - classifier.getSortedSplitters() + 1;
-    const bool use_equal_buckets = Cfg::kAllowEqualBuckets
-            && num_buckets - 1 - diff_splitters >= Cfg::kEqualBucketsThreshold;
+    // for (auto it = stripe_begin; it != stripe_end; ++it) {
+    //   differing_bits |= ref ^ extractor(*it);
+    // }
 
-    // Fill the array to the next power of two
-    log_buckets = log2(diff_splitters) + 1;
-    num_buckets = 1 << log_buckets;
-    for (int i = diff_splitters + 1; i < num_buckets; ++i) {
-        IPS4O_ASSUME_NOT(sorted_splitters + 1 == nullptr);
-        new (++sorted_splitters) typename Cfg::value_type(*splitter);
+    tmp[id] = differing_bits;
+
+    shared_->sync.barrier();
+
+    if (id == 0) {
+        const bool all_sorted = std::all_of(sorted_tmp.begin(), sorted_tmp.end(),
+                                            [](const bool& a) { return a; });
+
+        if (all_sorted) { return {0, 0}; }
+
+        differing_bits = std::accumulate(
+                tmp.begin(), tmp.end(), key_type{0},
+                [](const key_type& ka, const key_type& kb) { return ka | kb; });
+
+        const int lz = tlx::clz(differing_bits);
+        const int tz = tlx::ctz(differing_bits);
+
+        return {lz / 8, sizeof(key_type) - tz / 8};
+
+    } else {
+        return {0, 0};
     }
+}
 
-    // Build the tree
-    classifier.build(log_buckets);
-    this->classifier_ = &classifier;
+template <class Cfg>
+std::pair<int, int> Sorter<Cfg>::sequentialGetLevels(iterator begin, iterator end) {
+    if (begin == end) { return {0, 0}; }
 
-    const int used_buckets = num_buckets * (1 + use_equal_buckets);
-    return {used_buckets, use_equal_buckets};
+    auto [level_begin, level_end] = sampleLevels(begin, end);
+
+    if (level_begin != 0 || level_end != sizeof(key_type)) {
+        const typename Cfg::Extractor& extractor = local_.classifier.getExtractor();
+
+        key_type ref = extractor(*begin);
+        key_type differing_bits{0};
+
+        // Calculate differing bits.
+        // If last element is not smaller than first element,
+        // test for sorted input (input is not reverse sorted).
+        if (extractor(*begin) <= extractor(*(end - 1))) {
+            bool sorted = true;
+            iterator it = begin;
+            for (; (it + 1) != end; ++it) {
+                differing_bits |= ref ^ extractor(*it);
+                sorted &= extractor(*it) <= extractor(*(it + 1));
+            }
+
+            if (sorted) { return {0, 0}; }
+
+            differing_bits |= ref ^ extractor(*it);
+
+        } else {
+            // Check whether the input is reverse sorted.
+
+            bool reverse_sorted = true;
+            iterator it = begin;
+            for (; (it + 1) != end; ++it) {
+                differing_bits |= ref ^ extractor(*it);
+                reverse_sorted &= *(it + 1) < *it;
+            }
+
+            if (reverse_sorted) {
+                std::reverse(begin, end);
+                return {0, 0};
+            }
+
+            differing_bits |= ref ^ extractor(*it);
+        }
+
+        const int lz = tlx::clz(differing_bits);
+        const int tz = tlx::ctz(differing_bits);
+
+        return {lz / 8, sizeof(key_type) - tz / 8};
+    } else {
+        return {level_begin, level_end};
+    }
+}
+
+template <class Cfg>
+bool Sorter<Cfg>::nextLevelExists(int level) {
+    return level + 1 < level_end_;
+}
+
+template <class Cfg>
+bool Sorter<Cfg>::levelExists(int level) {
+    return level < level_end_;
+}
+
+template <class Cfg>
+bool Sorter<Cfg>::isLastLevel(int level) {
+    assert(levelExists(level));
+    return level + 1 == level_end_;
 }
 
 }  // namespace detail
-}  // namespace ips4o
+}  // namespace ips2ra

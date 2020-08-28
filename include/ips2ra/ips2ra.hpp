@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/ips4o.hpp
+ * include/ips2ra/ips2ra.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -39,49 +39,73 @@
 #include <iterator>
 #include <type_traits>
 
-#include "ips4o_fwd.hpp"
+#include "ips2ra_fwd.hpp"
 #include "base_case.hpp"
 #include "config.hpp"
 #include "memory.hpp"
 #include "parallel.hpp"
 #include "sequential.hpp"
 
-namespace ips4o {
+namespace ips2ra {
 
 /**
  * Helper function for creating a reusable sequential sorter.
  */
-template <class It, class Cfg = Config<>, class Comp = std::less<>>
-SequentialSorter<ExtendedConfig<It, Comp, Cfg>> make_sorter(Comp comp = Comp()) {
-  return SequentialSorter<ExtendedConfig<It, Comp, Cfg>>{true, std::move(comp)};
+template <class It, class Extractor = Config<>::identity, class Cfg = Config<>>
+SequentialSorter<ExtendedConfig<It, Extractor, Cfg>> make_sorter(
+        Extractor extractor = Extractor{}) {
+    return SequentialSorter<ExtendedConfig<It, Extractor, Cfg>>{std::move(extractor)};
 }
 
 /**
  * Configurable interface.
  */
-template <class Cfg, class It, class Comp = std::less<>>
-void sort(It begin, It end, Comp comp = Comp()) {
-  if (detail::sortedCaseSort(begin, end, comp)) return;
-  
-  if ((end - begin) <= Cfg::kBaseCaseMultiplier * Cfg::kBaseCaseSize) {
-    detail::baseCaseSort(std::move(begin), std::move(end), std::move(comp));
-  } else {
-    ips4o::SequentialSorter<ips4o::ExtendedConfig<It, Comp, Cfg>> sorter{false, std::move(comp)};
-    sorter(std::move(begin), std::move(end));
-  }
+template <class Cfg, class It, class Extractor = Config<>::identity>
+void sort(It begin, It end, Extractor extractor = Extractor{}) {
+#ifdef IPS4O_TIMER
+    g_active_counters = -1;
+    g_total.start();
+    g_overhead.start();
+#endif
+
+    static constexpr std::ptrdiff_t threshold =
+            Cfg::kSmallestSortMultiplier * Cfg::kSmallestSortSize;
+    if (end - begin <= threshold) {
+#ifdef IPS4O_TIMER
+        g_overhead.stop();
+        g_base_case.start();
+#endif
+
+        std::ptrdiff_t offs[2 * (threshold + 1)];
+        detail::baseCaseSort<Cfg::kSmallestSortSize, threshold>(begin, end, offs,
+                                                                extractor);
+
+#ifdef IPS4O_TIMER
+        g_base_case.stop();
+        g_overhead.start();
+#endif
+    } else {
+        ips2ra::make_sorter<It, Extractor, Cfg>(std::move(extractor))(std::move(begin),
+                                                                      std::move(end));
+    }
+
+#ifdef IPS4O_TIMER
+    g_overhead.stop();
+    g_total.stop();
+#endif
 }
 
 /**
  * Standard interface.
  */
-template <class It, class Comp>
-void sort(It begin, It end, Comp comp) {
-    ips4o::sort<Config<>>(std::move(begin), std::move(end), std::move(comp));
+template <class It, class Extractor>
+void sort(It begin, It end, Extractor extractor) {
+    ips2ra::sort<Config<>>(std::move(begin), std::move(end), std::move(extractor));
 }
 
 template <class It>
 void sort(It begin, It end) {
-    ips4o::sort<Config<>>(std::move(begin), std::move(end), std::less<>());
+    ips2ra::sort<Config<>>(std::move(begin), std::move(end), Config<>::identity{});
 }
 
 #if defined(_REENTRANT) || defined(_OPENMP)
@@ -90,59 +114,87 @@ namespace parallel {
 /**
  * Helper functions for creating a reusable parallel sorter.
  */
-template <class It, class Cfg = Config<>, class ThreadPool, class Comp = std::less<>>
+template <class It, class Cfg = Config<>, class ThreadPool,
+          class Extractor = Config<>::identity>
 std::enable_if_t<std::is_class<std::remove_reference_t<ThreadPool>>::value,
-                 ParallelSorter<ExtendedConfig<It, Comp, Cfg, ThreadPool>>>
-make_sorter(ThreadPool&& thread_pool, Comp comp = Comp()) {
-    return ParallelSorter<ExtendedConfig<It, Comp, Cfg, ThreadPool>>(
-            std::move(comp), std::forward<ThreadPool>(thread_pool));
+                 ParallelSorter<ExtendedConfig<It, Extractor, Cfg, ThreadPool>>>
+make_sorter(ThreadPool&& thread_pool, Extractor extractor = Extractor{}) {
+    return ParallelSorter<ExtendedConfig<It, Extractor, Cfg, ThreadPool>>(
+            std::move(extractor), std::forward<ThreadPool>(thread_pool));
 }
 
-template <class It, class Cfg = Config<>, class Comp = std::less<>>
-ParallelSorter<ExtendedConfig<It, Comp, Cfg>> make_sorter(
-        int num_threads = DefaultThreadPool::maxNumThreads(), Comp comp = Comp()) {
-    return ParallelSorter<ExtendedConfig<It, Comp, Cfg>>(
-            std::move(comp), DefaultThreadPool(num_threads));
+template <class It, class Cfg = Config<>, class Extractor = Config<>::identity>
+ParallelSorter<ExtendedConfig<It, Extractor, Cfg>> make_sorter(
+        int num_threads = DefaultThreadPool::maxNumThreads(),
+        Extractor extractor = Extractor{}) {
+    return ParallelSorter<ExtendedConfig<It, Extractor, Cfg>>(
+            std::move(extractor), DefaultThreadPool(num_threads));
 }
 
 /**
  * Configurable interface.
  */
-template <class Cfg = Config<>, class It, class Comp, class ThreadPool>
-std::enable_if_t<std::is_class<std::remove_reference_t<ThreadPool>>::value>
-sort(It begin, It end, Comp comp, ThreadPool&& thread_pool) {
-    if (Cfg::numThreadsFor(begin, end, thread_pool.numThreads()) < 2)
-        ips4o::sort<Cfg>(std::move(begin), std::move(end), std::move(comp));
-    else
-        ips4o::parallel::make_sorter<It, Cfg>(
-                std::forward<ThreadPool>(thread_pool), std::move(comp))(std::move(begin),
-                                                                        std::move(end));
+template <class Cfg = Config<>, class It, class Extractor, class ThreadPool>
+std::enable_if_t<std::is_class<std::remove_reference_t<ThreadPool>>::value> sort(
+        It begin, It end, Extractor extractor, ThreadPool&& thread_pool) {
+#ifdef IPS4O_TIMER
+    g_active_counters = -1;
+    g_total.start();
+    g_overhead.start();
+#endif
+
+    if (Cfg::numThreadsFor(begin, end, thread_pool.numThreads()) < 2) {
+        ips2ra::sort<Cfg>(std::move(begin), std::move(end), std::move(extractor));
+    } else {
+        ips2ra::parallel::make_sorter<It, Cfg>(std::forward<ThreadPool>(thread_pool),
+                                               std::move(extractor))(std::move(begin),
+                                                                     std::move(end));
+    }
+
+#ifdef IPS4O_TIMER
+    g_overhead.stop();
+    g_total.stop();
+#endif
 }
 
-template <class Cfg = Config<>, class It, class Comp>
-void sort(It begin, It end, Comp comp, int num_threads) {
+template <class Cfg = Config<>, class It, class Extractor>
+void sort(It begin, It end, Extractor extractor, int num_threads) {
+#ifdef IPS4O_TIMER
+    g_active_counters = -1;
+    g_total.start();
+    g_overhead.start();
+#endif
+
     num_threads = Cfg::numThreadsFor(begin, end, num_threads);
-    if (num_threads < 2)
-        ips4o::sort<Cfg>(std::move(begin), std::move(end), std::move(comp));
-    else
-        ips4o::parallel::make_sorter<It, Cfg>(num_threads, std::move(comp))
-                (std::move(begin), std::move(end));
+    if (num_threads < 2) {
+        ips2ra::sort<Cfg>(std::move(begin), std::move(end), std::move(extractor));
+    } else {
+        ips2ra::parallel::make_sorter<It, Cfg>(num_threads, std::move(extractor))(
+                std::move(begin), std::move(end));
+    }
+
+#ifdef IPS4O_TIMER
+    g_overhead.stop();
+    g_total.stop();
+#endif
 }
 
 /**
  * Standard interface.
  */
-template <class It, class Comp>
-void sort(It begin, It end, Comp comp) {
-    ips4o::parallel::sort<Config<>>(std::move(begin), std::move(end), std::move(comp),
-                                    DefaultThreadPool::maxNumThreads());
+template <class It, class Extractor>
+void sort(It begin, It end, Extractor extractor) {
+    ips2ra::parallel::sort<Config<>>(std::move(begin), std::move(end),
+                                     std::move(extractor),
+                                     DefaultThreadPool::maxNumThreads());
 }
-
 template <class It>
 void sort(It begin, It end) {
-    ips4o::parallel::sort(std::move(begin), std::move(end), std::less<>());
+    ips2ra::parallel::sort<Config<>>(std::move(begin), std::move(end),
+                                     Config<>::identity{},
+                                     DefaultThreadPool::maxNumThreads());
 }
 
 }  // namespace parallel
 #endif  // _REENTRANT || _OPENMP
-}  // namespace ips4o
+}  // namespace ips2ra

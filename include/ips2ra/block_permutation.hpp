@@ -1,7 +1,7 @@
 /******************************************************************************
- * ips4o/block_permutation.hpp
+ * include/ips2ra/block_permutation.hpp
  *
- * In-place Parallel Super Scalar Samplesort (IPS⁴o)
+ * In-place Parallel Super Scalar Radix Sort (IPS²Ra)
  *
  ******************************************************************************
  * BSD 2-Clause License
@@ -37,11 +37,11 @@
 
 #include <tuple>
 
-#include "ips4o_fwd.hpp"
+#include "ips2ra_fwd.hpp"
 #include "classifier.hpp"
 #include "memory.hpp"
 
-namespace ips4o {
+namespace ips2ra {
 namespace detail {
 
 /**
@@ -50,7 +50,7 @@ namespace detail {
  */
 template <class Cfg>
 int Sorter<Cfg>::computeOverflowBucket() {
-    int bucket = num_buckets_ - 1;
+    int bucket = Cfg::kMaxBuckets - 1;
     while (bucket >= 0
            && (bucket_start_[bucket + 1] - bucket_start_[bucket]) <= Cfg::kBlockSize)
         --bucket;
@@ -61,7 +61,7 @@ int Sorter<Cfg>::computeOverflowBucket() {
  * Tries to read a block from read_bucket.
  */
 template <class Cfg>
-template <bool kEqualBuckets, bool kIsParallel>
+template <bool kIsParallel>
 int Sorter<Cfg>::classifyAndReadBlock(const int read_bucket) {
     auto& bp = bucket_pointers_[read_bucket];
 
@@ -78,14 +78,14 @@ int Sorter<Cfg>::classifyAndReadBlock(const int read_bucket) {
     local_.swap[0].readFrom(begin_ + read);
     if (kIsParallel) bp.stopRead();
 
-    return classifier_->template classify<kEqualBuckets>(local_.swap[0].head());
+    return classifier_->classify(local_.swap[0].head(), level_);
 }
 
 /**
- * Finds a slot for the block in the swap buffer. May or may not read another block instead.
+ * Finds a slot for the block in the swap buffer. May or may not read another block.
  */
 template <class Cfg>
-template <bool kEqualBuckets, bool kIsParallel>
+template <bool kIsParallel>
 int Sorter<Cfg>::swapBlock(const diff_t max_off, const int dest_bucket,
                            const bool current_swap) {
     diff_t write, read;
@@ -108,7 +108,7 @@ int Sorter<Cfg>::swapBlock(const diff_t max_off, const int dest_bucket,
             return -1;
         }
         // Check if block needs to be moved
-        new_dest_bucket = classifier_->template classify<kEqualBuckets>(begin_[write]);
+        new_dest_bucket = classifier_->template classify(begin_[write], level_);
     } while (new_dest_bucket == dest_bucket);
 
     // Swap blocks
@@ -122,29 +122,30 @@ int Sorter<Cfg>::swapBlock(const diff_t max_off, const int dest_bucket,
  * Block permutation phase.
  */
 template <class Cfg>
-template <bool kEqualBuckets, bool kIsParallel>
+template <bool kIsParallel>
 void Sorter<Cfg>::permuteBlocks() {
-    const auto num_buckets = num_buckets_;
     // Distribute starting points of threads
-    int read_bucket = (my_id_ * num_buckets / num_threads_) % num_buckets;
+    int read_bucket = (my_id_ * Cfg::kMaxBuckets / num_threads_) % Cfg::kMaxBuckets;
     // Not allowed to write to this offset, to avoid overflow
     const diff_t max_off = Cfg::alignToNextBlock(end_ - begin_ + 1) - Cfg::kBlockSize;
 
     // Go through all buckets
-    for (int count = num_buckets; count; --count) {
+    for (int count = Cfg::kMaxBuckets; count; --count) {
         int dest_bucket;
         // Try to read a block ...
-        while ((dest_bucket = classifyAndReadBlock<kEqualBuckets, kIsParallel>(read_bucket)) != -1) {
+        while ((dest_bucket = classifyAndReadBlock<kIsParallel>(read_bucket)) != -1) {
             bool current_swap = 0;
             // ... then write it to the correct bucket
-            while ((dest_bucket = swapBlock<kEqualBuckets, kIsParallel>(max_off, dest_bucket, current_swap)) != -1) {
+            while ((dest_bucket =
+                            swapBlock<kIsParallel>(max_off, dest_bucket, current_swap))
+                   != -1) {
                 // Read another block, keep going
                 current_swap = !current_swap;
             }
         }
-        read_bucket = (read_bucket + 1) % num_buckets;
+        read_bucket = (read_bucket + 1) % Cfg::kMaxBuckets;
     }
 }
 
 }  // namespace detail
-}  // namespace ips4o
+}  // namespace ips2ra
