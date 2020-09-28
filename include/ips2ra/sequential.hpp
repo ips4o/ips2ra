@@ -162,6 +162,9 @@ void Sorter<Cfg>::sequentialRec(const iterator begin, const iterator end,
     // Final base case is executed in cleanup step, so we're done here
     if (isLastLevel(level)) return;
 
+#ifdef IPS4O_TIMER
+    g_ips4o_level++;
+#endif
     // Recurse
     for (int i = 0; i < Cfg::kMaxBuckets; ++i) {
         const auto start = bucket_start[i];
@@ -169,6 +172,9 @@ void Sorter<Cfg>::sequentialRec(const iterator begin, const iterator end,
         if (stop - start > Cfg::kSmallestSortSize)
             sequentialRec(begin + start, begin + stop, level + 1);
     }
+#ifdef IPS4O_TIMER
+    g_ips4o_level--;
+#endif
 }
 
 }  // namespace detail

@@ -137,8 +137,8 @@ void Sorter<Cfg>::parallelClassification() {
         shared_->sync.barrier();
 
 #ifdef IPS4O_TIMER
-        g_classification.stop();
-        g_empty_block.start();
+	g_classification.stop(end_ - begin_, "class");
+	g_empty_block.start();
 #endif
 
         // Move empty blocks and set bucket write/read pointers
