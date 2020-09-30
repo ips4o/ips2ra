@@ -1,6 +1,6 @@
 # In-place Parallel Super Scalar Radix Sort (IPS²Ra)
 
-This is the implementation of the algorithm IPS²Ra presented in the publication [In-place Parallel Super Scalar Samplesort (IPS⁴o)](https://arxiv.org/abs/1705.02257) (todo update),
+This is the implementation of the algorithm IPS²Ra presented in the paper [Engineering In-place (Shared-memory) Sorting Algorithms](https://arxiv.org/abs/2009.13569),
 which contains an in-depth description of its inner workings, as well as an extensive experimental performance evaluation.
 Here's the abstract:
 
@@ -15,36 +15,37 @@ Here's the abstract:
 > distribution that is provably cache-efficient.  We also parallelize
 > this approach taking dynamic load balancing and memory locality into
 > account.
-> 
+>
 > Our new comparison-based algorithm *In-place Superscalar Samplesort
 > (IPS⁴o)*, combines this technique with branchless decision
-> trees. By taking cases with many equal elements into account and by
-> adapting the distribution degree dynamically, we obtain a highly
-> robust algorithm that outperforms the best previous in-place parallel
-> comparison-based sorting algorithms by almost a factor of three. That
-> algorithm also outperforms the best comparison-based competitors
-> regardless of whether we consider in-place or not in-place, parallel
-> or sequential settings.
-> 
-> Another surprising result is that IPS⁴o even outperforms
-> the best (in-place or not in-place) integer sorting algorithms in a
-> wide range of situations. In many of the remaining cases (often
-> involving near-uniform input distributions, small keys, or a
-> sequential setting), our new *In-place Parallel Super Scalar Radix
-> Sort (IPS²Ra)* turns out to be the best algorithm.
-> 
-> Claims to have the – in some sense – “best” sorting algorithm can
-> be found in many papers which cannot all be true.  Therefore, we base
-> our conclusions on an extensive experimental study involving a large
-> part of the cross product of 21 state-of-the-art sorting codes, 6 data
-> types, 10 input distributions, 4 machines, 4 memory allocation
-> strategies, and input sizes varying over 7 orders of magnitude. This
-> confirms the claims made about the robust performance of our
-> algorithms while revealing major performance problems in many
-> competitors outside the concrete set of measurements reported in the
-> associated publications. This is particularly true for integer sorting
-> algorithms giving one reason to prefer comparison-based algorithms for
-> robust general-purpose sorting.
+> trees. By taking cases with many equal elements into account and
+> by adapting the distribution degree dynamically, we obtain a
+> highly robust algorithm that outperforms the best previous
+> in-place parallel comparison-based sorting algorithms by almost a
+> factor of three. That algorithm also outperforms the best
+> comparison-based competitors regardless of whether we consider
+> in-place or not in-place, parallel or sequential settings.
+>
+> Another surprising result is that IPS⁴o even outperforms the best
+> (in-place or not in-place) integer sorting algorithms in a wide
+> range of situations. In many of the remaining cases (often involving
+> near-uniform input distributions, small keys, or a sequential
+> setting), our new *In-place Parallel Super Scalar Radix Sort
+> (IPS²Ra)* turns out to be the best algorithm.
+>
+> Claims to have the -- in some sense -- "best" sorting algorithm can
+> be found in many papers which cannot all be true.  Therefore, we
+> base our conclusions on an extensive experimental study involving a
+> large part of the cross product of 21 state-of-the-art sorting
+> codes, 6 data types, 10 input distributions, 4 machines, 4 memory
+> allocation strategies, and input sizes varying over 7 orders of
+> magnitude. This confirms the claims made about the robust
+> performance of our algorithms while revealing major performance
+> problems in many competitors outside the concrete set of
+> measurements reported in the associated publications. This is
+> particularly true for integer sorting algorithms giving one reason
+> to prefer comparison-based algorithms for robust general-purpose
+> sorting.
 
 The radix sort algorithm IPS²Ra is an adaption of the samplesort algorithm IPS⁴o. 
 The implementation of IPS⁴o is also available on [GitHub](https://github.com/ips4o/ips4o).
@@ -95,22 +96,15 @@ Currently, the code does not compile on Windows.
 
 ## Licensing
 
-IPS²Ra is free software provided under the BSD 2-Clause License described in the [LICENSE file](LICENSE). If you use IPS²Ra in an academic setting please cite the publication [In-place Parallel Super Scalar Samplesort (IPS⁴o)](https://arxiv.org/abs/1705.02257) (todo update) using the BibTeX entry
+IPS²Ra is free software provided under the BSD 2-Clause License described in the [LICENSE file](LICENSE). If you use IPS²Ra in an academic setting please cite the paper [Engineering In-place (Shared-memory) Sorting Algorithms](https://arxiv.org/abs/2009.13569) using the BibTeX entry
 
-(todo update)
 ```bibtex 
-@InProceedings{axtmann2017,
-  author =	{Michael Axtmann and
-                Sascha Witt and
-                Daniel Ferizovic and
-                Peter Sanders},
-  title =	{{In-Place Parallel Super Scalar Samplesort (IPSSSSo)}},
-  booktitle =	{25th Annual European Symposium on Algorithms (ESA 2017)},
-  pages =	{9:1--9:14},
-  series =	{Leibniz International Proceedings in Informatics (LIPIcs)},
-  year =	{2017},
-  volume =	{87},
-  publisher =	{Schloss Dagstuhl--Leibniz-Zentrum fuer Informatik},
-  doi =		{10.4230/LIPIcs.ESA.2017.9},
+@misc{axtmann2020engineering,
+  title =	 {Engineering In-place (Shared-memory) Sorting Algorithms},
+  author =	 {Michael Axtmann and Sascha Witt and Daniel Ferizovic and Peter Sanders},
+  howpublished = {Computing Research Repository (CoRR)},
+  year =	 {Sept. 2020},
+  archivePrefix ={arXiv},
+  eprint =	 {2009.13569},
 }
 ```
