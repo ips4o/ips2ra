@@ -48,11 +48,13 @@ int main(int argc, char** argv) {
   std::vector<unsigned long> v(1000000);
   for (auto& e : v) { e = dist(gen); }
 
-  // Sequential case
+  
+#if defined(_REENTRANT)
+  ips2ra::parallel::sort(v.begin(), v.end());
+#else
   ips2ra::sort(v.begin(), v.end());
-  // Parallel case
-  // ips2ra::parallel::sort(v.begin(), v.end());
-
+#endif
+  
   const bool sorted = std::is_sorted(v.begin(), v.end());
   std::cout << "Elements are sorted: " << std::boolalpha << sorted << std::endl;
 
