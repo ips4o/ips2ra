@@ -37,7 +37,7 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   endif()
 endif()
 
-option(IPS2RA_DISABLE_PARALLEL "Enable parallel code of Ips2ra" OFF)
+option(IPS2RA_DISABLE_PARALLEL "Disable parallel code of IPS2ra" OFF)
 if (NOT IPS2RA_DISABLE_PARALLEL)
 
   set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
