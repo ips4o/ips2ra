@@ -206,7 +206,7 @@ std::pair<int, int> Sorter<Cfg>::sequentialGetLevels(iterator begin, iterator en
             iterator it = begin;
             for (; (it + 1) != end; ++it) {
                 differing_bits |= ref ^ extractor(*it);
-                reverse_sorted &= *(it + 1) < *it;
+                reverse_sorted &= extractor(*(it + 1)) < extractor(*it);
             }
 
             if (reverse_sorted) {
