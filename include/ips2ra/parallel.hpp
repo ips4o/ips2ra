@@ -132,7 +132,7 @@ void Sorter<Cfg>::queueTasks(const int level, const diff_t stripe, const int id,
         for (int i = Cfg::kMaxBuckets - 1; i >= 0; --i) {
             const auto start = bucket_start[i];
             const auto stop = bucket_start[i + 1];
-            queueTask(start, stop, level + 1);
+            if (start < stop) queueTask(start, stop, level + 1);
         }
     }
 }
