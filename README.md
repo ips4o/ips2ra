@@ -81,7 +81,7 @@ A minimal working example:
 #include "ips2ra.hpp"
 
 // sort sequentially
-ips2ra::sort(begin, end[, comparator]);
+ips2ra::sort(begin, end[, Extractor = ips2ra::Config<>::identity]);
 
 // sort in parallel (uses OpenMP if available, std::thread otherwise)
 ips2ra::parallel::sort(begin, end);
