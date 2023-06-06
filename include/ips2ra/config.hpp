@@ -242,7 +242,7 @@ struct ExtendedConfig : public Cfg {
     /**
      * The key
      */
-    using key_type = std::remove_reference_t<std::result_of_t<Extractor(value_type)>>;
+    using key_type = std::remove_reference_t<std::invoke_result_t<Extractor, value_type>>;
 
     static_assert(std::is_unsigned<key_type>::value);
 

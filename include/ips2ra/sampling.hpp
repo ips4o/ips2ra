@@ -41,12 +41,11 @@
 #include <random>
 #include <utility>
 
-#include <tlx/math.hpp> // todo
-
 #include "ips2ra_fwd.hpp"
 #include "classifier.hpp"
 #include "config.hpp"
 #include "memory.hpp"
+#include "utils.hpp"
 
 namespace ips2ra {
 namespace detail {
@@ -90,8 +89,8 @@ std::pair<int, int> Sorter<Cfg>::sampleLevels(const iterator begin, const iterat
         differing_bits |= ref ^ extractor(*it);
     }
 
-    const int lz = tlx::clz(differing_bits);
-    const int tz = tlx::ctz(differing_bits);
+    const int lz = detail::clz(differing_bits);
+    const int tz = detail::ctz(differing_bits);
 
     return {lz / 8, sizeof(key_type) - tz / 8};
 }
@@ -108,7 +107,7 @@ std::pair<int, int> Sorter<Cfg>::parallelGetLevels(const iterator begin,
     if (begin == end) return {0, 0};
 
     const auto n = end - begin;
-    const auto stripe = tlx::div_ceil(n, num_threads);
+    const auto stripe = (n + num_threads - 1) / num_threads;
     const auto stripe_begin = begin + stripe * id;
     const auto stripe_end = begin + std::min(n, stripe * (id + 1));
 
@@ -162,8 +161,8 @@ std::pair<int, int> Sorter<Cfg>::parallelGetLevels(const iterator begin,
                 tmp.begin(), tmp.end(), key_type{0},
                 [](const key_type& ka, const key_type& kb) { return ka | kb; });
 
-        const int lz = tlx::clz(differing_bits);
-        const int tz = tlx::ctz(differing_bits);
+        const int lz = detail::clz(differing_bits);
+        const int tz = detail::ctz(differing_bits);
 
         return {lz / 8, sizeof(key_type) - tz / 8};
 
@@ -217,8 +216,8 @@ std::pair<int, int> Sorter<Cfg>::sequentialGetLevels(iterator begin, iterator en
             differing_bits |= ref ^ extractor(*it);
         }
 
-        const int lz = tlx::clz(differing_bits);
-        const int tz = tlx::ctz(differing_bits);
+        const int lz = detail::clz(differing_bits);
+        const int tz = detail::ctz(differing_bits);
 
         return {lz / 8, sizeof(key_type) - tz / 8};
     } else {

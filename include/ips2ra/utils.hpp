@@ -36,20 +36,50 @@
 #pragma once
 
 #include <cassert>
+#include <climits>
+#include <limits>
 
 #define IPS2RA_ASSUME_NOT(c) if (c) __builtin_unreachable()
 #define IPS2RA_IS_NOT(c) assert(!(c))
 
-#include <limits>
-
 namespace ips2ra {
 namespace detail {
+
+inline constexpr unsigned clz(unsigned int n) {
+    if (n == 0) return CHAR_BIT * sizeof(n);
+    return __builtin_clz(n);
+}
+
+inline constexpr unsigned clz(unsigned long n) {
+    if (n == 0) return CHAR_BIT * sizeof(n);
+    return __builtin_clzl(n);
+}
+
+inline constexpr unsigned clz(unsigned long long n) {
+    if (n == 0) return CHAR_BIT * sizeof(n);
+    return __builtin_clzll(n);
+}
+
+inline constexpr unsigned ctz(unsigned int n) {
+    if (n == 0) return CHAR_BIT * sizeof(n);
+    return __builtin_ctz(n);
+}
+
+inline constexpr unsigned ctz(unsigned long n) {
+    if (n == 0) return CHAR_BIT * sizeof(n);
+    return __builtin_ctzl(n);
+}
+
+inline constexpr unsigned ctz(unsigned long long n) {
+    if (n == 0) return CHAR_BIT * sizeof(n);
+    return __builtin_ctzll(n);
+}
 
 /**
  * Compute the logarithm to base 2, rounded down.
  */
 inline constexpr unsigned long log2(unsigned long n) {
-    return (std::numeric_limits<unsigned long>::digits - 1 - __builtin_clzl(n));
+    return (std::numeric_limits<unsigned long>::digits - 1 - clz(n));
 }
 
 template <int tmpl_idx, int last, class E, typename... Ts>
