@@ -168,7 +168,7 @@ class StdThreadPool {
 /**
  * Constructor for the std::thread pool.
  */
-StdThreadPool::Impl::Impl(int num_threads)
+inline StdThreadPool::Impl::Impl(int num_threads)
     : sync_(std::max(1, num_threads))
     , pool_barrier_(std::max(1, num_threads))
     , num_threads_(num_threads)
@@ -182,7 +182,7 @@ StdThreadPool::Impl::Impl(int num_threads)
 /**
  * Destructor for the std::thread pool.
  */
-StdThreadPool::Impl::~Impl() {
+inline StdThreadPool::Impl::~Impl() {
     done_ = true;
     pool_barrier_.barrier();
     for (auto& t : threads_)
@@ -206,7 +206,7 @@ void StdThreadPool::Impl::run(F&& func, int num_threads) {
 /**
  * Main loop for threads created by the std::thread pool.
  */
-void StdThreadPool::Impl::main(const int my_id) {
+inline void StdThreadPool::Impl::main(const int my_id) {
     for (;;) {
         pool_barrier_.barrier();
         if (done_) break;
@@ -274,13 +274,13 @@ class ThreadJoiningThreadPool {
 /**
  * Constructor for the std::thread pool.
  */
-ThreadJoiningThreadPool::Impl::Impl(int num_threads)
+inline ThreadJoiningThreadPool::Impl::Impl(int num_threads)
     : sync_(num_threads), pool_barrier_(num_threads), num_threads_(num_threads) {}
 
 /**
  * Destructor for the std::thread pool.
  */
-ThreadJoiningThreadPool::Impl::~Impl() { assert(done_ == true); }
+inline ThreadJoiningThreadPool::Impl::~Impl() { assert(done_ == true); }
 
 /**
  * Entry point for parallel execution for the std::thread pool.
@@ -299,7 +299,7 @@ void ThreadJoiningThreadPool::Impl::run(F&& func, int num_threads) {
 /**
  * Main loop for threads which have joined.
  */
-void ThreadJoiningThreadPool::Impl::main(const int my_id) {
+inline void ThreadJoiningThreadPool::Impl::main(const int my_id) {
     for (;;) {
         pool_barrier_.barrier();
         if (done_) break;
@@ -308,9 +308,9 @@ void ThreadJoiningThreadPool::Impl::main(const int my_id) {
     }
 }
 
-void ThreadJoiningThreadPool::Impl::join(int my_id) { main(my_id); }
+inline void ThreadJoiningThreadPool::Impl::join(int my_id) { main(my_id); }
 
-void ThreadJoiningThreadPool::Impl::release_threads() {
+inline void ThreadJoiningThreadPool::Impl::release_threads() {
     done_ = true;
     pool_barrier_.barrier();
 }
