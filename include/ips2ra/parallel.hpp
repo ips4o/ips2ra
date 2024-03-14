@@ -394,6 +394,7 @@ class ParallelSorter {
                     std::vector<std::shared_ptr<typename Sorter::SubThreadPool>> tp_trash;
 
                     if (my_id == 0) {
+                        primary_sorter.setShared(&shared);
                         if (adjust_levels) {
                             std::tie(level_begin, level_end) =
                                     primary_sorter.parallelGetLevels(
@@ -402,20 +403,19 @@ class ParallelSorter {
                             shared.sync.barrier();
                             if (level_begin >= level_end) return;
                         }
-                        primary_sorter.setShared(&shared);
                         primary_sorter.parallelSortPrimary(begin, end, num_threads,
                                                            buffer_storage_, tp_trash,
                                                            level_begin, level_end);
                     } else {
                         auto& shared = this->shared_ptr_.get();
                         Sorter sorter(*shared.local[my_id]);
+                        sorter.setShared(&shared);
                         if (adjust_levels) {
                             sorter.parallelGetLevels(begin, end, differing_bits,
                                                      sorted_store, my_id, num_threads);
                             shared.sync.barrier();
                             if (level_begin >= level_end) return;
                         }
-                        sorter.setShared(&shared);
                         sorter.parallelSortSecondary(begin, end, my_id, num_threads,
                                                      buffer_storage_, tp_trash,
                                                      level_begin, level_end);
