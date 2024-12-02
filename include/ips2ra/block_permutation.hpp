@@ -108,7 +108,7 @@ int Sorter<Cfg>::swapBlock(const diff_t max_off, const int dest_bucket,
             return -1;
         }
         // Check if block needs to be moved
-        new_dest_bucket = classifier_->template classify(begin_[write], level_);
+        new_dest_bucket = classifier_->classify(begin_[write], level_);
     } while (new_dest_bucket == dest_bucket);
 
     // Swap blocks
