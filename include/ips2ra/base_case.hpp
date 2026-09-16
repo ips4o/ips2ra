@@ -49,7 +49,8 @@ namespace detail {
  */
 template <class It, class Comp>
 void insertionSort(const It begin, const It end, Comp comp) {
-    IPS2RA_ASSUME_NOT(begin >= end);
+    IPS2RA_ASSUME_NOT(begin > end);
+    if (begin == end) return;
 
     for (It it = begin + 1; it < end; ++it) {
         auto val = std::move(*it);
